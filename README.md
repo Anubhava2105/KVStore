@@ -34,6 +34,15 @@ with KVStore.open("./demo") as store:
     store.delete(b"alpha")
 ```
 
+The repository includes a small Python application that uses the same API:
+
+```sh
+PYTHONPATH=src python3 examples/basic_usage.py
+```
+
+It stores two settings, reads them back, and deletes one. The example writes
+its data to `./demo`.
+
 The CLI encodes its key and value arguments as UTF-8. `get` and `delete` return
 exit code `1` when the key does not exist; argparse usage errors return `2`,
 and operational failures return `3`.
@@ -101,6 +110,7 @@ opening a segment directly and writing without the lock.
 
 ## Project files
 
+- `examples/basic_usage.py`: a small Python application using the library API.
 - `src/record.py`: binary record encoding, decoding, and checksums.
 - `src/wal.py`: append-only WAL, fsync policy, rotation, and locking hooks.
 - `src/index.py`: in-memory key-to-location index.
