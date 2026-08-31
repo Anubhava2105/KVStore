@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 
 from index import Index, IndexEntry
-from record import decode
+from record import HEADER_SIZE, RecordError, decode, record_length_from_header
 from wal import WAL
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _key_bytes(key: bytes | bytearray | memoryview) -> bytes:
@@ -42,7 +46,8 @@ class KVStore:
 
     ``put`` and ``delete`` are fsync-per-operation by default. Set
     ``sync_per_write=False`` to batch durability and call ``flush`` explicitly.
-    Recovery is added in the next implementation stage.
+    Opening a store replays valid records and truncates any torn or corrupt
+    suffix from each segment.
     """
 
     def __init__(self, wal: WAL) -> None:
@@ -56,7 +61,14 @@ class KVStore:
              segment_max_bytes: int = 64 * 1024 * 1024) -> "KVStore":
         wal = WAL(path, sync_per_write=sync_per_write,
                   segment_max_bytes=segment_max_bytes).open()
-        return cls(wal)
+        store = cls(wal)
+        try:
+            with wal.writer_lock():
+                store._recover()
+        except Exception:
+            wal.close()
+            raise
+        return store
 
     @property
     def path(self) -> Path:
@@ -65,6 +77,64 @@ class KVStore:
     def _ensure_open(self) -> None:
         if self._closed:
             raise RuntimeError("KVStore is closed")
+
+    def _recover(self) -> None:
+        """Replay segments and discard each segment's invalid suffix."""
+        highest_sequence = 0
+        for segment_id, segment in self._segments_in_order():
+            fd = os.open(segment, os.O_RDWR)
+            try:
+                offset = 0
+                file_size = os.fstat(fd).st_size
+                while offset < file_size:
+                    os.lseek(fd, offset, os.SEEK_SET)
+                    header = os.read(fd, HEADER_SIZE)
+                    if len(header) != HEADER_SIZE:
+                        self._discard_suffix(fd, segment, offset, file_size,
+                                             "torn header")
+                        break
+                    try:
+                        length = record_length_from_header(header)
+                    except RecordError as error:
+                        self._discard_suffix(fd, segment, offset, file_size,
+                                             str(error))
+                        break
+                    if file_size - offset < length:
+                        self._discard_suffix(fd, segment, offset, file_size,
+                                             "torn payload")
+                        break
+                    try:
+                        payload = _read_exact(fd, length - HEADER_SIZE)
+                        record = decode(header + payload)
+                    except (OSError, RecordError) as error:
+                        self._discard_suffix(fd, segment, offset, file_size,
+                                             str(error))
+                        break
+
+                    entry = IndexEntry(segment_id, offset, length)
+                    if record.value is None:
+                        self._index.remove(record.key)
+                    else:
+                        self._index.set(record.key, entry)
+                    highest_sequence = max(highest_sequence, record.sequence)
+                    offset += length
+            finally:
+                os.close(fd)
+        self._next_sequence = highest_sequence + 1
+
+    def _segments_in_order(self):
+        for segment in self._wal.segment_paths():
+            segment_id = int(segment.stem.split("-")[1])
+            yield segment_id, segment
+
+    @staticmethod
+    def _discard_suffix(fd: int, segment: Path, offset: int,
+                        file_size: int, reason: str) -> None:
+        discarded = file_size - offset
+        os.ftruncate(fd, offset)
+        os.fsync(fd)
+        LOGGER.warning("discarded %d bytes from %s at offset %d: %s",
+                       discarded, segment, offset, reason)
 
     def put(self, key: bytes | bytearray | memoryview,
             value: bytes | bytearray | memoryview) -> None:

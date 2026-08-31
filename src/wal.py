@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 import re
 
-from platform import acquire_lock, release_lock
+from sys_platform import acquire_lock, release_lock
 from record import encode
 
 
