@@ -22,6 +22,12 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="defer fsync until the command closes the store (faster, less durable)",
     )
+    parser.add_argument(
+        "--auto-compact-segments",
+        type=int,
+        metavar="N",
+        help="compact automatically after the log reaches N segments",
+    )
     commands = parser.add_subparsers(dest="command", required=True)
 
     put = commands.add_parser("put", help="store a UTF-8 value")
@@ -47,7 +53,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     sync_per_write = not args.batched
     try:
-        with KVStore.open(args.store, sync_per_write=sync_per_write) as store:
+        with KVStore.open(
+            args.store,
+            sync_per_write=sync_per_write,
+            auto_compact_segments=args.auto_compact_segments,
+        ) as store:
             if args.command == "put":
                 store.put(args.key.encode("utf-8"), args.value.encode("utf-8"))
                 return EXIT_OK

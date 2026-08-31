@@ -1,7 +1,7 @@
 # KVStore
 
 KVStore is a durable, embedded local key-value store implemented with only
-Python’s standard library. It uses an append-only write-ahead log, an
+Python's standard library. It uses an append-only write-ahead log, an
 in-memory key index, CRC32-protected records, crash recovery, and atomic
 segment compaction.
 
@@ -17,6 +17,13 @@ make build
 ```
 
 The library API is bytes-oriented:
+
+When running a script from the repository root, add `src` to Python's import
+path first:
+
+```sh
+PYTHONPATH=src python3 your_script.py
+```
 
 ```python
 from store import KVStore
@@ -34,13 +41,12 @@ and operational failures return `3`.
 ## Durability model
 
 Each normal `put` and `delete` writes a complete record, calls `os.fsync()` on
-the active segment, and only then updates the in-memory index. This is the
-durability boundary: when the operation returns successfully, the record has
-been handed to the operating system for durable storage. The tradeoff is
-throughput—fsync per write is slower than batching. Pass
-`sync_per_write=False` to the API or `--batched` to the CLI for faster writes,
-then call `flush()`; data written since the last flush is intentionally not
-protected from a crash.
+the active segment, and only then updates the in-memory index. A successful
+operation has therefore handed its record to the operating system for durable
+storage. Fsync per write slows writes compared with batching. Pass
+`sync_per_write=False` to the API or `--batched` to the CLI for faster writes.
+Call `flush()` before relying on batched writes after a crash. Data written
+since the last flush is not protected.
 
 Records contain a CRC32, sequence number, key length, value length, key, and
 value. A delete is a tombstone record. Segment files live under `data/` and
@@ -48,44 +54,50 @@ are rotated by size.
 
 ## Recovery and compaction
 
-Opening a store takes the exclusive cooperative writer lock, scans segments in
-numeric creation order, verifies every record, rebuilds the index, and resumes
-the sequence number after the highest valid record. If it sees a torn header,
-torn payload, invalid lengths, or a CRC mismatch, it truncates that segment at
-the last known-good offset and logs the discarded suffix. Recovery is `O(log
-size)` because the complete log is replayed on every startup; a larger system
-would periodically checkpoint its index.
+When a process opens a store, it acquires the exclusive cooperative writer
+lock. It scans segments in numeric creation order, verifies each record,
+rebuilds the index, and resumes the sequence number after the highest valid
+record. If it finds a torn header, torn payload, invalid lengths, or a CRC
+mismatch, it truncates that segment at the last known-good offset and logs the
+discarded suffix. Recovery reads the complete log on every startup, so startup
+time grows with the amount of log data. A larger system would periodically
+checkpoint its index.
 
-`compact()` takes the writer lock for its snapshot and rewrite. It writes live
-records to a temporary segment, fsyncs it, atomically installs it with
-`os.replace()`, syncs the containing directory, removes old segments, syncs
-the directory again, and finally swaps the in-memory index. A crash before
-rename leaves old segments untouched; a crash after rename can leave both old
-and new segments, and recovery can safely replay that state.
+`compact()` acquires the writer lock, takes a snapshot, and rewrites the live
+records. It fsyncs the temporary segment, installs it with `os.replace()`, and
+syncs the containing directory. It then removes the old segments, syncs the
+directory again, and swaps the in-memory index. A crash before the rename
+leaves the old segments untouched. A crash after the rename can leave both old
+and new segments, and recovery can replay that state safely.
 
-Compaction is currently manual. The shipped policy does not include an
-automatic size trigger yet; this is a scoped follow-up.
+Compaction is manual by default. Applications can opt into a synchronous
+segment-count policy with `KVStore.open(path, auto_compact_segments=8)` or the
+CLI flag `--auto-compact-segments 8`. After a successful write, if the log has
+at least the configured number of segments, the writer releases its operation
+lock and starts compaction. Compaction adds write latency and disk I/O at the
+trigger point, so the default remains manual. If it fails, the store retains
+the already-durable write and logs the failure. A later write can try again.
 
 ## Platform and concurrency scope
 
-OS-specific behavior is isolated in `sys_platform.py`. The POSIX backend uses
-`fcntl.flock` for shared/exclusive locking and fsyncs the data directory after
-compaction. The project is developed and tested on POSIX through Linux/WSL2.
-Windows support is a scoped follow-up, not a redesign; its current backend
-raises `NotImplementedError` rather than making an untested durability claim.
+The project keeps OS-specific behavior in `sys_platform.py`. The POSIX backend
+uses `fcntl.flock` for shared and exclusive locking and fsyncs the data
+directory after compaction. The project is developed and tested on POSIX
+through Linux and WSL2. The Windows backend currently raises
+`NotImplementedError`, so the project makes no Windows durability claim.
 
-The single-writer guarantee is advisory and applies only to cooperating
-clients that use this library’s lock file. It does not prevent an arbitrary
-script from opening a segment directly and writing without the lock.
+The single-writer guarantee is advisory. It applies only to cooperating clients
+that use this library's lock file. It does not stop an arbitrary script from
+opening a segment directly and writing without the lock.
 
 ## Known limitations
 
-- The index is entirely in memory and therefore RAM-bound. An on-disk B-tree
-  or SSTable index is out of scope.
-- Recovery replays the complete log on startup and has no index checkpoint.
+- The index stays in memory, so its size is limited by available RAM. An
+  on-disk B-tree or SSTable index is out of scope.
+- Recovery reads the complete log on startup and has no index checkpoint.
 - Single-writer safety is advisory against arbitrary direct file access.
-- Compaction is manual rather than automatically triggered by segment size.
-- POSIX is the tested platform; Windows support is not yet implemented.
+- Compaction is manual by default; automatic segment-count compaction is opt-in.
+- POSIX is the tested platform. Windows support is not yet implemented.
 
 ## Project files
 

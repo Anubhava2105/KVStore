@@ -1,8 +1,7 @@
 # Standard-library substitutions
 
-KVStore deliberately has no runtime dependencies outside Python’s standard
-library. The implementation uses these standard modules in place of common
-third-party conveniences:
+KVStore uses only Python's standard library at runtime. It uses these modules
+instead of common third-party packages:
 
 1. `zlib.crc32` replaces `crc32c` or `fastcrc` packages for record checksums.
 2. `struct.pack` and `struct.unpack` replace `construct` or `bitstruct` for the binary format.
@@ -16,5 +15,5 @@ third-party conveniences:
 10. `unittest` and `subprocess` replace pytest and process-test helpers.
 11. `contextlib.contextmanager` and `dataclasses` provide lifecycle and data-object abstractions.
 
-The Windows branch remains an explicit `NotImplementedError`. The POSIX
-backend is the tested implementation for Linux, WSL2, and macOS development.
+The Windows backend still raises `NotImplementedError`. The POSIX backend is
+the tested implementation for Linux, WSL2, and macOS development.

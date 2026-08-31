@@ -30,6 +30,17 @@ class CLITests(unittest.TestCase):
                 self.assertEqual(main(["compact", directory]), EXIT_OK)
             self.assertEqual(output.getvalue().strip(), "1")
 
+    def test_auto_compaction_option(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for number in range(4):
+                self.assertEqual(main([
+                    "--auto-compact-segments", "2", "put", directory,
+                    f"key-{number}", "value",
+                ]), EXIT_OK)
+            with KVStore.open(directory) as store:
+                self.assertEqual(store.get(b"key-3"), b"value")
+                self.assertEqual(len(store._wal.segment_paths()), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
