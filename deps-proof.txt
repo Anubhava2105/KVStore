@@ -1,0 +1,7 @@
+stdlib-only dependency proof: PASS
+cli.py: __future__, argparse, logging, sys
+index.py: __future__, dataclasses
+record.py: __future__, dataclasses, struct, zlib
+store.py: __future__, logging, os, pathlib
+sys_platform.py: __future__, os, sys
+wal.py: __future__, contextlib, dataclasses, os, pathlib, re
