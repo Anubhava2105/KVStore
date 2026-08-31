@@ -13,6 +13,7 @@ from sys_platform import acquire_lock, release_lock, sync_directory
 
 
 SEGMENT_PATTERN = re.compile(r"segment-(\d+)\.log\Z")
+TEMP_SEGMENT_PATTERN = re.compile(r"segment-(\d+)\.log\.tmp\Z")
 
 
 @dataclass(frozen=True)
@@ -81,6 +82,13 @@ class WAL:
         return [self.data_dir / f"segment-{segment_id:020d}.log"
                 for segment_id in self._segment_ids()]
 
+    def temporary_segment_paths(self) -> list[Path]:
+        paths = []
+        for path in self.data_dir.iterdir() if self.data_dir.exists() else ():
+            if TEMP_SEGMENT_PATTERN.fullmatch(path.name) and path.is_file():
+                paths.append(path)
+        return sorted(paths)
+
     def _open_segment(self, segment_id: int) -> None:
         if self._active_fd is not None:
             os.close(self._active_fd)
@@ -90,6 +98,9 @@ class WAL:
 
     def _rotate(self) -> None:
         assert self._active_segment_id is not None
+        # Rotation closes the current descriptor. Sync it first so batched
+        # writes remain durable after the segment changes.
+        self.sync()
         self._open_segment(self._active_segment_id + 1)
 
     @property

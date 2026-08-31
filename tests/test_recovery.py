@@ -44,6 +44,28 @@ os.kill(os.getpid(), signal.SIGKILL)
 '''
 
 
+CRASH_DURING_RECOVERY_SCRIPT = r'''
+import os
+import signal
+import sys
+
+sys.path.insert(0, sys.argv[2])
+import store as store_module
+
+original_set = store_module.Index.set
+state = {"count": 0}
+
+def kill_during_recovery(index, key, entry):
+    state["count"] += 1
+    if state["count"] == 3:
+        os.kill(os.getpid(), signal.SIGKILL)
+    original_set(index, key, entry)
+
+store_module.Index.set = kill_during_recovery
+store_module.KVStore.open(sys.argv[1])
+'''
+
+
 class RecoveryTests(unittest.TestCase):
     def test_replays_latest_values_and_tombstones(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -92,6 +114,23 @@ class RecoveryTests(unittest.TestCase):
             with KVStore.open(directory) as store:
                 self.assertEqual(store.get(b"stable"), b"survives")
                 self.assertIsNone(store.get(b"torn"))
+
+    def test_crash_during_recovery_is_safe_to_retry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with KVStore.open(directory) as store:
+                for number in range(8):
+                    store.put(f"key-{number}".encode(), b"value")
+
+            result = subprocess.run(
+                [sys.executable, "-c", CRASH_DURING_RECOVERY_SCRIPT,
+                 directory, str(SRC)],
+                check=False,
+            )
+            self.assertEqual(result.returncode, -signal.SIGKILL)
+
+            with KVStore.open(directory) as store:
+                for number in range(8):
+                    self.assertEqual(store.get(f"key-{number}".encode()), b"value")
 
 
 if __name__ == "__main__":

@@ -46,22 +46,30 @@ class KVStore:
 
     ``put`` and ``delete`` are fsync-per-operation by default. Set
     ``sync_per_write=False`` to batch durability and call ``flush`` explicitly.
+    Set ``auto_compact_segments`` to opt into synchronous compaction after the
+    log reaches that many segments.
     Opening a store replays valid records and truncates any torn or corrupt
     suffix from each segment.
     """
 
-    def __init__(self, wal: WAL) -> None:
+    def __init__(self, wal: WAL, *, auto_compact_segments: int | None = None) -> None:
+        if auto_compact_segments is not None and auto_compact_segments < 2:
+            raise ValueError("auto_compact_segments must be at least 2")
         self._wal = wal
         self._index = Index()
         self._next_sequence = 1
+        self._replayed_offsets: dict[int, int] = {}
+        self._known_segment_ids: set[int] = set()
+        self._auto_compact_segments = auto_compact_segments
         self._closed = False
 
     @classmethod
     def open(cls, path: str | os.PathLike[str], *, sync_per_write: bool = True,
-             segment_max_bytes: int = 64 * 1024 * 1024) -> "KVStore":
+             segment_max_bytes: int = 64 * 1024 * 1024,
+             auto_compact_segments: int | None = None) -> "KVStore":
         wal = WAL(path, sync_per_write=sync_per_write,
                   segment_max_bytes=segment_max_bytes).open()
-        store = cls(wal)
+        store = cls(wal, auto_compact_segments=auto_compact_segments)
         try:
             with wal.writer_lock():
                 store._recover()
@@ -80,46 +88,17 @@ class KVStore:
 
     def _recover(self) -> None:
         """Replay segments and discard each segment's invalid suffix."""
+        self._cleanup_stale_temporary_segments()
+        self._index = Index()
+        self._replayed_offsets = {}
         highest_sequence = 0
         for segment_id, segment in self._segments_in_order():
-            fd = os.open(segment, os.O_RDWR)
-            try:
-                offset = 0
-                file_size = os.fstat(fd).st_size
-                while offset < file_size:
-                    os.lseek(fd, offset, os.SEEK_SET)
-                    header = os.read(fd, HEADER_SIZE)
-                    if len(header) != HEADER_SIZE:
-                        self._discard_suffix(fd, segment, offset, file_size,
-                                             "torn header")
-                        break
-                    try:
-                        length = record_length_from_header(header)
-                    except RecordError as error:
-                        self._discard_suffix(fd, segment, offset, file_size,
-                                             str(error))
-                        break
-                    if file_size - offset < length:
-                        self._discard_suffix(fd, segment, offset, file_size,
-                                             "torn payload")
-                        break
-                    try:
-                        payload = _read_exact(fd, length - HEADER_SIZE)
-                        record = decode(header + payload)
-                    except (OSError, RecordError) as error:
-                        self._discard_suffix(fd, segment, offset, file_size,
-                                             str(error))
-                        break
-
-                    entry = IndexEntry(segment_id, offset, length)
-                    if record.value is None:
-                        self._index.remove(record.key)
-                    else:
-                        self._index.set(record.key, entry)
-                    highest_sequence = max(highest_sequence, record.sequence)
-                    offset += length
-            finally:
-                os.close(fd)
+            offset, segment_highest = self._scan_segment(
+                segment_id, segment, self._index, truncate_invalid=True
+            )
+            self._replayed_offsets[segment_id] = offset
+            highest_sequence = max(highest_sequence, segment_highest)
+        self._known_segment_ids = set(self._replayed_offsets)
         self._next_sequence = highest_sequence + 1
 
     def _segments_in_order(self):
