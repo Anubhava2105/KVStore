@@ -30,5 +30,8 @@ class Index:
     def snapshot(self) -> dict[bytes, IndexEntry]:
         return self._entries.copy()
 
+    def replace(self, entries: dict[bytes, IndexEntry]) -> None:
+        self._entries = entries.copy()
+
     def __len__(self) -> int:
         return len(self._entries)

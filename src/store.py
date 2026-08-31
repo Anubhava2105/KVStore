@@ -7,8 +7,8 @@ import os
 from pathlib import Path
 
 from index import Index, IndexEntry
-from record import HEADER_SIZE, RecordError, decode, record_length_from_header
-from wal import WAL
+from record import HEADER_SIZE, Record, RecordError, decode, encode, record_length_from_header
+from wal import WAL, _write_all, sync_directory
 
 
 LOGGER = logging.getLogger(__name__)
@@ -136,6 +136,18 @@ class KVStore:
         LOGGER.warning("discarded %d bytes from %s at offset %d: %s",
                        discarded, segment, offset, reason)
 
+    def _read_entry(self, key: bytes, entry: IndexEntry) -> Record:
+        segment = self._wal.data_dir / f"segment-{entry.segment_id:020d}.log"
+        fd = os.open(segment, os.O_RDONLY)
+        try:
+            os.lseek(fd, entry.offset, os.SEEK_SET)
+            record = decode(_read_exact(fd, entry.length))
+        finally:
+            os.close(fd)
+        if record.key != key or record.value is None:
+            raise RuntimeError("index points to an unexpected record")
+        return record
+
     def put(self, key: bytes | bytearray | memoryview,
             value: bytes | bytearray | memoryview) -> None:
         self._ensure_open()
@@ -154,16 +166,7 @@ class KVStore:
             entry = self._index.get(key_data)
             if entry is None:
                 return None
-            segment = self._wal.data_dir / f"segment-{entry.segment_id:020d}.log"
-            fd = os.open(segment, os.O_RDONLY)
-            try:
-                os.lseek(fd, entry.offset, os.SEEK_SET)
-                record = decode(_read_exact(fd, entry.length))
-            finally:
-                os.close(fd)
-        if record.key != key_data or record.value is None:
-            raise RuntimeError("index points to an unexpected record")
-        return record.value
+            return self._read_entry(key_data, entry).value
 
     def delete(self, key: bytes | bytearray | memoryview) -> bool:
         self._ensure_open()
@@ -174,6 +177,49 @@ class KVStore:
             self._index.remove(key_data)
             self._next_sequence += 1
             return existed
+
+    def compact(self) -> int:
+        """Rewrite live records into one durable segment.
+
+        The writer lock is held for the snapshot, rewrite, rename, cleanup,
+        and index swap. A crash before the rename leaves the old segments
+        untouched; a crash after it leaves a complete replacement segment
+        that recovery can replay.
+        """
+        self._ensure_open()
+        with self._wal.writer_lock():
+            snapshot = self._index.snapshot()
+            old_segments = self._wal.segment_paths()
+            next_segment_id = (max(
+                [self._wal.active_segment_id]
+                + [int(path.stem.split("-")[1]) for path in old_segments]
+            ) + 1)
+            temp_path = self._wal.data_dir / (
+                f"segment-{next_segment_id:020d}.log.tmp"
+            )
+            new_entries: dict[bytes, IndexEntry] = {}
+            fd = os.open(temp_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            try:
+                offset = 0
+                for key, entry in sorted(snapshot.items()):
+                    record = self._read_entry(key, entry)
+                    encoded = encode(record.sequence, record.key, record.value)
+                    _write_all(fd, encoded)
+                    new_entries[key] = IndexEntry(next_segment_id, offset,
+                                                  len(encoded))
+                    offset += len(encoded)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+
+            self._wal.install_segment(temp_path, next_segment_id)
+            sync_directory(str(self._wal.data_dir))
+            for segment in old_segments:
+                if segment.exists():
+                    segment.unlink()
+            sync_directory(str(self._wal.data_dir))
+            self._index.replace(new_entries)
+            return len(new_entries)
 
     def flush(self) -> None:
         self._ensure_open()

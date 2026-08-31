@@ -8,8 +8,8 @@ import os
 from pathlib import Path
 import re
 
-from sys_platform import acquire_lock, release_lock
 from record import encode
+from sys_platform import acquire_lock, release_lock, sync_directory
 
 
 SEGMENT_PATTERN = re.compile(r"segment-(\d+)\.log\Z")
@@ -91,6 +91,30 @@ class WAL:
     def _rotate(self) -> None:
         assert self._active_segment_id is not None
         self._open_segment(self._active_segment_id + 1)
+
+    @property
+    def active_segment_id(self) -> int:
+        if self._active_segment_id is None:
+            raise RuntimeError("WAL is not open")
+        return self._active_segment_id
+
+    def install_segment(self, temp_path: str | os.PathLike[str],
+                        segment_id: int) -> Path:
+        """Atomically install a compacted segment as the active segment."""
+        if self._active_fd is None:
+            raise RuntimeError("WAL is not open")
+        target = self.data_dir / f"segment-{segment_id:020d}.log"
+        old_segment_id = self.active_segment_id
+        os.close(self._active_fd)
+        self._active_fd = None
+        try:
+            os.replace(temp_path, target)
+            self._open_segment(segment_id)
+        except Exception:
+            if self._active_fd is None:
+                self._open_segment(segment_id if target.exists() else old_segment_id)
+            raise
+        return target
 
     @contextmanager
     def writer_lock(self):
